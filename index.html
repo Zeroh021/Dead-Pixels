@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DEAD PIXELS - Hand Gesture Zombie Shooter</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js" crossorigin="anonymous"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0a0000;color:#c22;font-family:"Courier New",monospace;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh}
+#wrap{position:relative;width:min(96vw,calc(92vh*1.6));aspect-ratio:8/5;border:4px solid #400}
+canvas#g{width:100%;height:100%;image-rendering:pixelated;display:block;background:#000;cursor:crosshair}
+#cams{position:absolute;right:6px;bottom:6px;width:22%;display:none;border:2px solid #600}
+#cams video,#cams canvas{width:100%;display:block;transform:scaleX(-1)}
+#cams canvas{position:absolute;inset:0;height:100%}
+#ov{position:absolute;inset:0;background:rgba(0,0,0,.85);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:10px;gap:8px}
+#ov h1{margin:0;font-size:clamp(24px,6vw,56px);letter-spacing:4px;text-shadow:3px 3px #600}
+#ov p{margin:0;color:#ccc;font-size:clamp(10px,1.6vw,15px);max-width:560px;line-height:1.4}
+button{background:#600;color:#fff;border:3px outset #a22;font:inherit;padding:8px 18px;cursor:pointer;font-size:clamp(12px,2vw,18px)}
+button:hover{background:#900}
+#st{margin-top:6px;font-size:14px;color:#aaa}
+</style></head><body>
+<div id="wrap">
+<canvas id="g" width="320" height="200"></canvas>
+<div id="cams"><video id="cam" playsinline muted></video><canvas id="lm" width="160" height="120"></canvas></div>
+<div id="ov"><h1 id="title">DEAD PIXELS</h1>
+<p id="msg"><b>HAND:</b> point index finger = aim &amp; turn (move hand to screen edges to turn) &bull; make a FIST (or point finger UP) = FIRE &bull; open palm = RELOAD<br><b>KEYBOARD/MOUSE:</b> WASD move, mouse aim (edges turn), click/Space fire, R reload</p>
+<button id="b1">START WITH CAMERA</button><button id="b2">START (KEYBOARD / MOUSE)</button></div>
+</div>
+<div id="st">gesture: -</div>
+<script>
+const W=320,H=200,cv=document.getElementById('g'),c=cv.getContext('2d');
+const $=id=>document.getElementById(id);
+const M=["1111111111111111","1000000000000001","1011100000011101","1010000000000101","1010002220000101","1000002000000001","1000000000200001","1110000000200111","1000000220000001","1000200000000001","1000200011100001","1000000010000001","1011000000000101","1010000000000101","1000000000000001","1111111111111111"];
+const FOV=Math.PI/3,TF=Math.tan(FOV/2);
+let p,zs,kills,wave,state='menu',cx=W/2,cy=H/2,flash=0,hurt=0,reloadT=0,fireCd=0,last=0,keys={},zbuf=new Array(W),handSeen=false,prevFire=false,prevOpen=false,toSpawn=0,spT=0;
+const wall=(x,y)=>M[Math.floor(y)]?.[Math.floor(x)]!=='0';
+// ---- pixel zombie sprite ----
+const SW=16,SH=24,spr=document.createElement('canvas');spr.width=SW;spr.height=SH;
+(function(){const s=spr.getContext('2d');const r=(col,x,y,w,h)=>{s.fillStyle=col;s.fillRect(x,y,w,h)};
+r('#2f5a2a',5,0,6,6);r('#4a8a3a',6,1,4,4);r('#ff2200',6,2,1,1);r('#ff2200',9,2,1,1);r('#200',7,4,2,1);
+r('#4a3a6a',4,6,8,9);r('#3a2a50',4,6,2,9);r('#6a8a4a',1,7,3,2);r('#6a8a4a',12,7,3,2);r('#4a8a3a',0,8,2,2);r('#4a8a3a',14,8,2,2);
+r('#a00',7,8,2,3);r('#2a2a4a',4,15,3,9);r('#2a2a4a',9,15,3,9);r('#111',4,22,3,2);r('#111',9,22,3,2)})();
+function reset(){p={x:8,y:8,a:0,hp:100,mag:8,res:32};zs=[];kills=0;wave=1;toSpawn=4;reloadT=0;state='play'}
+function spawn(){for(let i=0;i<30;i++){const x=1+Math.random()*14,y=1+Math.random()*14;if(!wall(x,y)&&Math.hypot(x-p.x,y-p.y)>6){zs.push({x,y,hp:3,at:0,sx:-99,w:0,h:0,pd:99});return true}}}
+// ---- audio ----
+let ac;function snd(f,d,t='square',v=.15){try{ac=ac||new AudioContext();const o=ac.createOscillator(),g=ac.createGain();o.type=t;o.frequency.setValueAtTime(f,ac.currentTime);o.frequency.exponentialRampToValueAtTime(40,ac.currentTime+d);g.gain.setValueAtTime(v,ac.currentTime);g.gain.exponentialRampToValueAtTime(.001,ac.currentTime+d);o.connect(g).connect(ac.destination);o.start();o.stop(ac.currentTime+d)}catch(e){}}
+// ---- actions ----
+function shoot(){if(state!=='play'||fireCd>0||reloadT>0)return;if(p.mag<=0){snd(120,.05);fireCd=.3;return}
+p.mag--;fireCd=.28;flash=.08;snd(300,.15,'sawtooth',.25);
+let best=null;for(const z of zs){if(z.pd<zbuf[Math.max(0,Math.min(W-1,Math.floor(cx)))]+.01&&Math.abs(cx-z.sx)<z.w*.4&&Math.abs(cy-H/2)<z.h*.5){if(!best||z.pd<best.pd)best=z}}
+if(best){best.hp--;best.hit=.1;snd(90,.1,'sawtooth',.2);if(best.hp<=0){zs.splice(zs.indexOf(best),1);kills++}}}
+function reload(){if(state!=='play'||reloadT>0||p.mag>=8||p.res<=0)return;reloadT=1;snd(200,.2,'triangle',.2)}
+addEventListener('keydown',e=>{keys[e.code]=1;if(e.code==='Space')shoot();if(e.code==='KeyR')reload();if(e.code==='Enter'&&state==='dead')reset()});
+addEventListener('keyup',e=>keys[e.code]=0);
+cv.addEventListener('mousemove',e=>{if(handSeen)return;const r=cv.getBoundingClientRect();cx=(e.clientX-r.left)/r.width*W;cy=(e.clientY-r.top)/r.height*H});
+cv.addEventListener('mousedown',()=>{if(state==='dead')reset();else shoot()});
+// ---- hand tracking ----
+async function startCam(){try{const v=$('cam');v.srcObject=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});await v.play();$('cams').style.display='block';
+const hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${f}`});
+hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:.6,minTrackingConfidence:.5});hands.onResults(onHands);
+(async function loop(){if(v.readyState>=2)await hands.send({image:v});requestAnimationFrame(loop)})()}catch(e){alert('Camera/hand tracking unavailable ('+e.message+'). Use HTTPS or localhost. Falling back to mouse.')}}
+function onHands(r){const lc=$('lm').getContext('2d');lc.clearRect(0,0,160,120);
+if(!r.multiHandLandmarks||!r.multiHandLandmarks.length){handSeen=false;$('st').textContent='gesture: no hand';return}
+handSeen=true;const L=r.multiHandLandmarks[0];lc.fillStyle='#0f0';L.forEach(q=>lc.fillRect(q.x*160-1,q.y*120-1,3,3));
+const d=(a,b)=>Math.hypot(L[a].x-L[b].x,L[a].y-L[b].y),ext=(t,pp)=>d(0,t)>d(0,pp)*1.1;
+const idx=ext(8,6),mid=ext(12,10),ring=ext(16,14),pin=ext(20,18),open=idx&&mid&&ring&&pin,gun=idx&&!mid&&!ring;
+const up=(L[8].y-L[5].y)/d(0,9)<-.6,fist=!idx&&!mid&&!ring&&!pin,fire=fist||(gun&&up);
+if(idx&&!fire){const tx=(1-(L[5].x+L[8].x)/2)*W,ty=((L[5].y+L[8].y)/2)*H;cx+=(tx-cx)*.45;cy+=(ty-cy)*.45}
+if(fire&&!prevFire)shoot();if(open&&!prevOpen)reload();prevFire=fire;prevOpen=open;
+$('st').textContent='gesture: '+(open?'RELOAD (open palm)':fire?'FIRE (fist / finger up)':gun?'GUN (aiming)':'-')}
+// ---- update ----
+function upd(dt){if(state!=='play')return;fireCd-=dt;flash-=dt;hurt-=dt;
+if(reloadT>0){reloadT-=dt;if(reloadT<=0){const n=Math.min(8-p.mag,p.res);p.mag+=n;p.res-=n}}
+const E=.22;if(cx<W*E)p.a-=(E-cx/W)/E*2.6*dt;if(cx>W*(1-E))p.a+=(cx/W-(1-E))/E*2.6*dt;
+if(keys.ArrowLeft)p.a-=2.2*dt;if(keys.ArrowRight)p.a+=2.2*dt;
+let f=(keys.KeyW?1:0)-(keys.KeyS?1:0),s=(keys.KeyD?1:0)-(keys.KeyA?1:0),sp=3*dt;
+let nx=p.x+(Math.cos(p.a)*f-Math.sin(p.a)*s)*sp,ny=p.y+(Math.sin(p.a)*f+Math.cos(p.a)*s)*sp;
+if(!wall(nx,p.y))p.x=nx;if(!wall(p.x,ny))p.y=ny;
+if(toSpawn>0){spT-=dt;if(spT<=0){spawn();toSpawn--;spT=1.2}}else if(!zs.length){wave++;toSpawn=3+wave*2;p.res+=16}
+for(const z of zs){z.hit-=dt;const dx=p.x-z.x,dy=p.y-z.y,dd=Math.hypot(dx,dy),v=(.7+wave*.07)*dt;
+if(dd>.8){const mx=z.x+dx/dd*v,my=z.y+dy/dd*v;if(!wall(mx,z.y))z.x=mx;if(!wall(z.x,my))z.y=my}
+else{z.at-=dt;if(z.at<=0){z.at=.9;p.hp-=8;hurt=.25;snd(70,.2,'sawtooth',.25);if(p.hp<=0){state='dead'}}}}}
+// ---- render ----
+function render(){c.fillStyle='#1c1410';c.fillRect(0,0,W,H/2);c.fillStyle='#3a2c20';c.fillRect(0,H/2,W,H/2);
+for(let x=0;x<W;x++){const ra=p.a+Math.atan((x/W*2-1)*TF),rx=Math.cos(ra),ry=Math.sin(ra);
+let mx=Math.floor(p.x),my=Math.floor(p.y),ddx=Math.abs(1/rx),ddy=Math.abs(1/ry),sx=rx<0?-1:1,sy=ry<0?-1:1,
+sdx=(rx<0?p.x-mx:mx+1-p.x)*ddx,sdy=(ry<0?p.y-my:my+1-p.y)*ddy,side=0,t='1';
+for(let i=0;i<40;i++){if(sdx<sdy){sdx+=ddx;mx+=sx;side=0}else{sdy+=ddy;my+=sy;side=1}t=M[my]?.[mx]||'1';if(t!=='0')break}
+const pd=(side?sdy-ddy:sdx-ddx)*Math.cos(ra-p.a);zbuf[x]=pd;const h=Math.min(H*3,H/pd),top=H/2-h/2;
+let wx=side?p.x+(sdy-ddy)*rx:p.y+(sdx-ddx)*ry;wx-=Math.floor(wx);
+const sh=Math.max(.15,1-pd/10)*(side?.7:1),base=t==='2'?[110,110,120]:[140,50,40];
+let m=(wx*4%1)<.06?.6:1;c.fillStyle=`rgb(${base[0]*sh*m|0},${base[1]*sh*m|0},${base[2]*sh*m|0})`;c.fillRect(x,top,1,h+1);
+c.fillStyle=`rgba(0,0,0,.45)`;for(let k=1;k<4;k++)c.fillRect(x,top+h*k/4,1,Math.max(1,h/40))}
+for(const z of zs){const dx=z.x-p.x,dy=z.y-p.y;let a=Math.atan2(dy,dx)-p.a;a=Math.atan2(Math.sin(a),Math.cos(a));z.pd=Math.hypot(dx,dy)*Math.cos(a);
+if(Math.abs(a)>FOV||z.pd<.2){z.sx=-999;continue}z.sx=W/2*(1+Math.tan(a)/TF);z.h=H/z.pd;z.w=z.h*SW/SH}
+for(const z of [...zs].sort((a,b)=>b.pd-a.pd)){if(z.sx<-900)continue;const x0=Math.floor(z.sx-z.w/2);
+for(let x=Math.max(0,x0);x<Math.min(W,x0+z.w);x++){if(z.pd>=zbuf[x])continue;c.drawImage(spr,Math.floor((x-x0)/z.w*SW),0,1,SH,x,H/2-z.h/2+z.h*.1,1,z.h);
+if(z.hit>0){c.fillStyle='rgba(255,255,255,.6)';c.fillRect(x,H/2-z.h/2+z.h*.1,1,z.h)}}}
+// gun
+const gx=W/2+(cx-W/2)*.35,gy=H-(reloadT>0?-20*Math.sin(Math.min(1,reloadT)*Math.PI)*-1:0);
+if(flash>0){c.fillStyle='#ff0';c.fillRect(gx-8,gy-62,16,14);c.fillStyle='#f80';c.fillRect(gx-4,gy-70,8,10)}
+c.fillStyle='#444';c.fillRect(gx-8,gy-48,16,26);c.fillStyle='#666';c.fillRect(gx-6,gy-48,4,26);c.fillStyle='#222';c.fillRect(gx-14,gy-22,28,22);c.fillStyle='#a74';c.fillRect(gx-8,gy-10,16,10);
+// crosshair
+c.fillStyle='#0f0';const X=cx|0,Y=cy|0;c.fillRect(X-5,Y,3,1);c.fillRect(X+3,Y,3,1);c.fillRect(X,Y-5,1,3);c.fillRect(X,Y+3,1,3);
+if(hurt>0){c.fillStyle=`rgba(200,0,0,${hurt*1.6})`;c.fillRect(0,0,W,H)}
+// HUD
+c.fillStyle='#000';c.fillRect(0,H-12,W,12);c.fillStyle='#e22';c.font='8px monospace';
+c.fillText(`HP ${Math.max(0,p.hp)}`,4,H-3);c.fillText(`AMMO ${p.mag}/${p.res}${reloadT>0?' RELOADING':''}`,70,H-3);c.fillText(`KILLS ${kills}  WAVE ${wave}`,200,H-3)}
+function loop(t){const dt=Math.min(.05,(t-last)/1e3||0);last=t;if(state!=='menu'){upd(dt);render()}
+if(state==='dead'){$('title').textContent='YOU DIED';$('msg').innerHTML=`Kills: ${kills} &bull; Wave: ${wave}<br>Click or press Enter to restart`;$('b1').style.display=$('b2').style.display='none';$('ov').style.display='flex'}
+requestAnimationFrame(loop)}
+function go(){$('ov').style.display='none';reset()}
+$('b1').onclick=()=>{go();startCam()};$('b2').onclick=go;
+$('ov').addEventListener('click',()=>{if(state==='dead')go()});
+requestAnimationFrame(loop);
+</script></body></html>
